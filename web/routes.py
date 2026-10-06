@@ -12,12 +12,15 @@ import time
 import uuid
 from typing import Optional
 
-from flask import Blueprint, current_app, jsonify, request
+from flask import Blueprint, current_app, jsonify, request, Response
 
 from nlp import (get_constituency_parser, get_embeddings, get_keywords, get_ner,
                  get_parser, get_segmenter, get_sentiment, get_summarizer,
-                 get_tagger, get_translator, ENTITY_TYPE_NAMES, TAG_NAMES,
-                 DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
+                 get_tagger, get_translator, get_extractor,
+                 ENTITY_TYPE_NAMES, TAG_NAMES, DEP_REL_NAMES, PHRASE_NAMES,
+                 POLARITY_NAMES, FIELD_TYPE_NAMES)
+from nlp.extraction import (FieldTemplate, FieldSpec, BUILTIN_TEMPLATES,
+                            get_builtin_templates)
 from nlp.lexicon import STOPWORDS
 from storage import StoreRegistry
 
@@ -111,6 +114,7 @@ def meta():
         "phrase_names": PHRASE_NAMES,
         "entity_type_names": ENTITY_TYPE_NAMES,
         "polarity_names": POLARITY_NAMES,
+        "field_type_names": FIELD_TYPE_NAMES,
         "directions": [{"id": "zh2en", "name": "中文 → 英文"},
                        {"id": "en2zh", "name": "英文 → 中文"}],
     })
@@ -564,6 +568,408 @@ def get_pipeline_run(run_id: str):
     if not records:
         return jsonify({"error": "执行记录不存在"}), 404
     return jsonify(records[0])
+
+
+# ---------------------------------------------------------------------------
+# 模板化字段抽取
+# ---------------------------------------------------------------------------
+
+TEMPLATE_TASK = "extract_template"
+RESULT_TASK = "extract_result"
+_BUILTIN_KEYS = {t["key"] for t in BUILTIN_TEMPLATES}
+
+
+def _template_store():
+    return _registry().task(TEMPLATE_TASK)
+
+
+def _result_store():
+    return _registry().task(RESULT_TASK)
+
+
+def _parse_template(data: dict) -> FieldTemplate:
+    """从请求构造模板，非法字段直接抛 ValueError（由路由转 400）。"""
+    fields = [FieldSpec.from_dict(f) for f in data.get("fields", [])]
+    return FieldTemplate(
+        name=(data.get("name") or "").strip(),
+        fields=fields,
+        key=data.get("key"),
+        version=int(data.get("version", 1)),
+        description=data.get("description", ""),
+    )
+
+
+def _public_template(record: dict) -> dict:
+    return {
+        "id": record.get("id"),
+        "key": record.get("template", {}).get("key"),
+        "name": record.get("name"),
+        "description": record.get("description", ""),
+        "version": record.get("version", 1),
+        "built_in": record.get("built_in", False),
+        "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at"),
+        "template": record.get("template"),
+    }
+
+
+def seed_builtin_templates() -> int:
+    """首次使用时植入内置模板（简历/合同/通知），已存在则跳过。
+
+    内置模板以固定 key 存在 extract_template 存储里；用户后续调整会
+    生成新版本记录，但已有抽取结果内嵌模板快照，不受影响。
+    """
+    store = _template_store()
+    existing = {r.get("template", {}).get("key")
+                for r in store.all() if not r.get("_deleted")}
+    count = 0
+    now = time.time()
+    for tpl in get_builtin_templates():
+        if tpl.key in existing:
+            continue
+        data = tpl.to_dict()
+        store.insert({
+            "name": tpl.name,
+            "description": tpl.description,
+            "version": 1,
+            "built_in": True,
+            "template": data,
+            "updated_at": now,
+        })
+        count += 1
+    return count
+
+
+@api.get("/extract/templates")
+def list_extract_templates():
+    records = [r for r in _template_store().all() if not r.get("_deleted")]
+    records.sort(key=lambda r: (not r.get("built_in", False),
+                                r.get("created_at", 0)))
+    return jsonify({"templates": [_public_template(r) for r in records]})
+
+
+@api.post("/extract/templates")
+def create_extract_template():
+    data = _payload()
+    if not (data.get("name") or "").strip():
+        return jsonify({"error": "模板名称不能为空"}), 400
+    try:
+        tpl = _parse_template(data)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    if tpl.key:
+        dup = any(r.get("template", {}).get("key") == tpl.key
+                  for r in _template_store().all() if not r.get("_deleted"))
+        if dup:
+            return jsonify({"error": f"模板标识 {tpl.key} 已存在"}), 400
+    record = {
+        "name": tpl.name,
+        "description": tpl.description,
+        "version": 1,
+        "built_in": False,
+        "template": tpl.to_dict(),
+        "updated_at": time.time(),
+    }
+    rid = _template_store().insert(record)
+    saved = _template_store().get(rid)
+    return jsonify({"ok": True, "id": rid, "template": _public_template(saved)})
+
+
+def _find_template(ident: str) -> Optional[dict]:
+    """按记录 id 或模板 key 找当前模板（墓碑除外）。"""
+    store = _template_store()
+    record = store.get(ident)
+    if record and not record.get("_deleted"):
+        return record
+    for r in store.all():
+        if r.get("_deleted"):
+            continue
+        if r.get("template", {}).get("key") == ident:
+            return r
+    return None
+
+
+
+@api.get("/extract/templates/<ident>")
+def get_extract_template(ident: str):
+    record = _find_template(ident)
+    if not record:
+        return jsonify({"error": "模板不存在"}), 404
+    return jsonify(_public_template(record))
+
+
+@api.put("/extract/templates/<ident>")
+def update_extract_template(ident: str):
+    """调整模板：字段变化时版本号 +1，旧抽取结果仍引用旧快照，不被冲乱。"""
+    store = _template_store()
+    record = _find_template(ident)
+    if not record:
+        return jsonify({"error": "模板不存在"}), 404
+    data = _payload()
+    merged = {"name": data.get("name", record["name"]),
+              "description": data.get("description",
+                                      record.get("description", "")),
+              "fields": data.get("fields",
+                                 record["template"].get("fields", []))}
+    old_tpl = record["template"]
+    merged["key"] = data.get("key", old_tpl.get("key"))
+    try:
+        tpl = _parse_template(merged)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    version = record.get("version", 1)
+    if data.get("fields") and data["fields"] != old_tpl.get("fields"):
+        version += 1
+    tpl.version = version
+    updated = store.update(record["id"], {
+        "name": tpl.name,
+        "description": tpl.description,
+        "version": version,
+        "template": tpl.to_dict(),
+        "updated_at": time.time(),
+    })
+    return jsonify({"ok": True, "template": _public_template(updated),
+                    "version": version})
+
+
+@api.delete("/extract/templates/<ident>")
+def delete_extract_template(ident: str):
+    record = _find_template(ident)
+    if not record:
+        return jsonify({"error": "模板不存在"}), 404
+    ok = _template_store().delete(record["id"])
+    return jsonify({"ok": ok})
+
+
+@api.get("/extract/meta")
+def extract_meta():
+    return jsonify({
+        "field_types": [{"id": k, "name": v}
+                        for k, v in FIELD_TYPE_NAMES.items()],
+    })
+
+
+def _run_extraction(text: str, ident: str) -> tuple[Optional[dict], Optional[str]]:
+    record = _find_template(ident)
+    if not record:
+        return None, "模板不存在"
+    tpl = FieldTemplate.from_dict(record["template"])
+    result = get_extractor().extract(text, tpl)
+    return result, None
+
+
+@api.post("/extract/run")
+def extract_run():
+    """对单条文本（或语料库文档）按模板抽取；默认持久化结果。"""
+    data = _payload()
+    text, cid = _resolve_text(data)
+    ident = data.get("template_id") or data.get("template")
+    if not text:
+        return jsonify({"error": "缺少文本"}), 400
+    if not ident:
+        return jsonify({"error": "请选择抽取模板"}), 400
+    result, err = _run_extraction(text, ident)
+    if err:
+        return jsonify({"error": err}), 404
+    if data.get("save", True):
+        record = _find_template(ident)
+        rid = _result_store().insert({
+            "text": text,
+            "corpus_id": cid,
+            "template_id": record["id"],
+            "template_key": record["template"].get("key"),
+            "template_version": result["template_version"],
+            "result": result,
+            "complete": result["complete"],
+            "missing": result["missing"],
+            "ambiguous": result["ambiguous"],
+            "created_at": time.time(),
+        })
+        result["id"] = rid
+    return jsonify({"ok": True, "result": result})
+
+
+@api.post("/extract/batch")
+def extract_batch():
+    """批量对语料库文档抽取，逐篇容错；结果逐篇分片存储。"""
+    data = _payload()
+    ident = data.get("template_id") or data.get("template")
+    record = _find_template(ident) if ident else None
+    if not record:
+        return jsonify({"error": "模板不存在"}), 404
+    corpus_store = _registry().task("corpus")
+    corpus_ids = data.get("corpus_ids") or []
+    if corpus_ids:
+        docs = [(c, corpus_store.get(c)) for c in corpus_ids]
+        docs = [(c, d) for c, d in docs if d and not d.get("_deleted")]
+    else:
+        docs = [(r["id"], r) for r in corpus_store.all()
+                if not r.get("_deleted")]
+    if not docs:
+        return jsonify({"error": "没有可处理的语料文档"}), 400
+
+    tpl = FieldTemplate.from_dict(record["template"])
+    extractor = get_extractor()
+    items, succeeded, failed = [], 0, 0
+    for cid, doc in docs:
+        try:
+            result = extractor.extract(doc["text"], tpl)
+            rid = _result_store().insert({
+                "text": doc["text"],
+                "corpus_id": cid,
+                "template_id": record["id"],
+                "template_key": record["template"].get("key"),
+                "template_version": result["template_version"],
+                "result": result,
+                "complete": result["complete"],
+                "missing": result["missing"],
+                "ambiguous": result["ambiguous"],
+                "created_at": time.time(),
+            })
+            items.append({"corpus_id": cid, "id": rid, "ok": True,
+                          "complete": result["complete"],
+                          "missing": result["missing"],
+                          "ambiguous": result["ambiguous"]})
+            succeeded += 1
+        except Exception as exc:  # noqa: BLE001
+            items.append({"corpus_id": cid, "ok": False, "error": str(exc)})
+            failed += 1
+    return jsonify({"ok": True, "succeeded": succeeded, "failed": failed,
+                    "results": items})
+
+
+@api.get("/extract/results")
+def list_extract_results():
+    where = []
+    for key in ("template_id", "template_key", "corpus_id", "complete"):
+        val = request.args.get(key)
+        if val is not None and val != "":
+            where.append((key, "eq", val if key != "complete"
+                          else (val in ("1", "true", "True"))))
+    records = _result_store().query(
+        where=where or None,
+        order_by=request.args.get("order_by", "created_at"),
+        order=request.args.get("order", "desc"),
+        limit=request.args.get("limit", type=int),
+        offset=request.args.get("offset", 0, type=int))
+    return jsonify({"count": len(records), "records": records})
+
+
+@api.get("/extract/results/<rid>")
+def get_extract_result(rid: str):
+    record = _result_store().get(rid)
+    if not record or record.get("_deleted"):
+        return jsonify({"error": "抽取结果不存在"}), 404
+    return jsonify(record)
+
+
+@api.delete("/extract/results/<rid>")
+def delete_extract_result(rid: str):
+    ok = _result_store().delete(rid)
+    return jsonify({"ok": ok})
+
+
+def _flatten_field_value(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return " | ".join(_flatten_field_value(v) for v in value)
+    if isinstance(value, dict):
+        return value.get("text") or json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+@api.get("/extract/results/<rid>/table")
+def extract_result_table(rid: str):
+    """把单次（或同一模板的一批）结果转成表格列：字段 -> 取值。"""
+    store = _result_store()
+    if rid == "all":
+        template_key = request.args.get("template_key")
+        records = store.all()
+        if template_key:
+            records = [r for r in records
+                       if r.get("template_key") == template_key]
+    else:
+        record = store.get(rid)
+        if not record or record.get("_deleted"):
+            return jsonify({"error": "抽取结果不存在"}), 404
+        records = [record]
+    records = [r for r in records if not r.get("_deleted")]
+
+    columns: list[str] = []
+    rows = []
+    for r in records:
+        result = r.get("result", {})
+        snapshot = result.get("template_snapshot", {})
+        fields = result.get("fields", {})
+        for spec in snapshot.get("fields", []):
+            if spec["key"] not in columns:
+                columns.append(spec["key"])
+        row = {
+            "_id": r.get("id"),
+            "_corpus_id": r.get("corpus_id", ""),
+            "_status": {k: v.get("status") for k, v in fields.items()},
+        }
+        for key, f in fields.items():
+            row[key] = _flatten_field_value(f.get("value"))
+        rows.append(row)
+    return jsonify({"columns": columns,
+                     "field_meta": {s["key"]: s
+                                    for r in records
+                                    for s in r.get("result", {})
+                                    .get("template_snapshot", {})
+                                    .get("fields", [])},
+                     "rows": rows})
+
+
+@api.get("/extract/results/<rid>/export")
+def extract_result_export(rid: str):
+    """导出 CSV（UTF-8 BOM，Excel 可直接打开）。"""
+    import csv
+    import io
+
+    store = _result_store()
+    if rid == "all":
+        template_key = request.args.get("template_key")
+        records = [r for r in store.all() if not r.get("_deleted")]
+        if template_key:
+            records = [r for r in records
+                       if r.get("template_key") == template_key]
+    else:
+        record = store.get(rid)
+        if not record or record.get("_deleted"):
+            return jsonify({"error": "抽取结果不存在"}), 404
+        records = [record]
+
+    columns, seen = [], set()
+    for r in records:
+        for s in r.get("result", {}).get("template_snapshot", {}).get("fields", []):
+            if s["key"] not in seen:
+                seen.add(s["key"])
+                columns.append((s["key"], s["name"]))
+
+    buf = io.StringIO()
+    buf.write("﻿")
+    writer = csv.writer(buf)
+    writer.writerow(["记录ID", "语料ID"] + [name for _, name in columns])
+    for r in records:
+        fields = r.get("result", {}).get("fields", {})
+        row = [r.get("id", ""), r.get("corpus_id", "")]
+        for key, _ in columns:
+            f = fields.get(key, {})
+            if f.get("status") == "missing":
+                row.append("【缺失】")
+            elif f.get("status") == "ambiguous":
+                row.append("【歧义:" + " / ".join(
+                    c.get("text", "") for c in f.get("candidates", [])) + "】")
+            else:
+                row.append(_flatten_field_value(f.get("value")))
+        writer.writerow(row)
+    filename = f"extract_{rid}.csv"
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 
 # ---------------------------------------------------------------------------

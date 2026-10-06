@@ -52,8 +52,13 @@ class NERExtractor:
         self._max_entity_len = max((len(k) for k in self._entity_dict), default=6)
 
     # -- 对外接口 ---------------------------------------------------------
-    def recognize(self, text: str) -> list[dict]:
-        """返回实体列表，每个实体含 ``start/end/text/type``（字符偏移）。"""
+    def recognize(self, text: str, with_source: bool = False) -> list[dict]:
+        """返回实体列表，每个实体含 ``start/end/text/type``（字符偏移）。
+
+        ``with_source=True`` 时额外带 ``source`` 字段：
+        ``regex``（正则）/ ``dict``（词典）/ ``rule``（结构规则），
+        供调用方按可信度筛选。
+        """
         entities: list[dict] = []
         consumed: list[tuple[int, int]] = []
 
@@ -67,6 +72,7 @@ class NERExtractor:
                 entities.append({
                     "start": m.start(), "end": m.end(),
                     "text": m.group(), "type": etype,
+                    **({"source": "regex"} if with_source else {}),
                 })
 
         # 2. 字典最长匹配（人名/地名/机构）
@@ -76,6 +82,8 @@ class NERExtractor:
             if self._overlaps(span, consumed):
                 continue
             consumed.append(span)
+            if with_source:
+                ent["source"] = "dict"
             entities.append(ent)
 
         # 3. 结构规则（姓氏+名 / 后缀）
@@ -85,6 +93,8 @@ class NERExtractor:
             if self._overlaps(span, consumed):
                 continue
             consumed.append(span)
+            if with_source:
+                ent["source"] = "rule"
             entities.append(ent)
 
         entities.sort(key=lambda e: e["start"])

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from nlp import (get_keywords, get_ner, get_parser, get_segmenter,
                  get_sentiment, get_summarizer, get_tagger, get_translator,
-                 get_constituency_parser)
+                 get_constituency_parser, get_extractor)
 from nlp.lexicon import STOPWORDS
 
 from .stage import Stage
@@ -70,6 +70,38 @@ def _parse(ctx, params):
     return {"parse": {"dependency": dep, "constituency": const}}
 
 
+def _extract(ctx, params):
+    """模板化字段抽取。
+
+    参数：
+      - ``template_id``：已保存模板的记录 id 或 key（运行时从存储读取）；
+      - ``template``：内联模板 dict（不经过存储，便于临时配置）。
+    抽取结果（含模板快照与逐处偏移）写入上下文 ``extraction``。
+    """
+    from nlp.extraction import FieldTemplate
+    text = ctx.get("clean_text") or ctx.get("text", "")
+    inline = params.get("template")
+    if inline:
+        tpl = FieldTemplate.from_dict(inline)
+    else:
+        from flask import current_app
+        ident = params.get("template_id")
+        if not ident:
+            raise ValueError("extract 阶段需要 template_id 或 template 参数")
+        store = current_app.config["STORE_REGISTRY"].task("extract_template")
+        record = store.get(ident)
+        if not record or record.get("_deleted"):
+            for r in store.all():
+                if not r.get("_deleted") and \
+                        r.get("template", {}).get("key") == ident:
+                    record = r
+                    break
+        if not record or record.get("_deleted"):
+            raise ValueError(f"抽取模板不存在: {ident}")
+        tpl = FieldTemplate.from_dict(record["template"])
+    return {"extraction": get_extractor().extract(text, tpl)}
+
+
 BUILTIN_STAGES = [
     Stage("clean", _clean, inputs=["text"], outputs=["clean_text"],
           description="文本清洗：去空白、去停用词", params={"remove_stopwords": True}),
@@ -89,4 +121,8 @@ BUILTIN_STAGES = [
           description="机器翻译（模拟）", params={"direction": "zh2en"}),
     Stage("parse", _parse, inputs=["text", "clean_text"], outputs=["parse"],
           description="句法分析"),
+    Stage("extract", _extract, inputs=["text", "clean_text"],
+          outputs=["extraction"],
+          description="模板化字段抽取（简历/合同/通知等）",
+          params={"template_id": "resume"}),
 ]

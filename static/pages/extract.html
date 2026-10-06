@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>模板化字段抽取 - NLP 流水线平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    .tpl-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+    .tpl-tab { padding: 7px 14px; border: 1px solid var(--border); border-radius: 8px;
+               background: var(--surface-2); cursor: pointer; font-size: 13px; }
+    .tpl-tab.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+    .field-row { display: grid; grid-template-columns: 1.4fr 1fr 1.6fr 0.7fr 0.7fr auto;
+                 gap: 8px; align-items: center; margin-bottom: 8px; }
+    .field-row input, .field-row select { padding: 7px 9px; font-size: 13px; }
+    .field-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+                  border: 1px solid var(--border); border-radius: 999px; margin: 3px;
+                  background: var(--surface-2); font-size: 12.5px; }
+    .field-chip b { font-weight: 600; }
+    .field-val { border-bottom: 1px dashed var(--primary); cursor: pointer; }
+    .field-val:hover { background: var(--primary-soft); }
+    .st-found { color: var(--green); }
+    .st-inferred { color: var(--amber); }
+    .st-ambiguous { color: var(--red); }
+    .st-missing { color: var(--text-muted); }
+    mark.flash { background: #fde68a; padding: 0 1px; border-radius: 2px; transition: background 1.2s; }
+    table.gridtbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+    table.gridtbl th, table.gridtbl td { border: 1px solid var(--border); padding: 7px 9px;
+                                         text-align: left; vertical-align: top; }
+    table.gridtbl th { background: var(--surface-2); font-weight: 600; white-space: nowrap; }
+    .src-tag { font-size: 11px; padding: 0 5px; border-radius: 4px; margin-left: 4px;
+               border: 1px solid var(--border); color: var(--text-muted); }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">模板化字段抽取</h1>
+    <p class="page-desc">按用户定义的字段模板，从简历、合同、通知等半结构化文本抽取规整字段；缺失显式标记，多写法保留证据，结果可逐处回查原文。</p>
+
+    <!-- 模板区 -->
+    <section class="card">
+      <div class="toolbar">
+        <h2 style="margin:0;flex:1">字段模板</h2>
+        <button class="btn secondary small" id="btn-tpl-new">新建模板</button>
+        <button class="btn secondary small" id="btn-tpl-edit">编辑当前模板</button>
+        <button class="btn danger small" id="btn-tpl-del">删除</button>
+        <span class="muted small" id="tpl-meta"></span>
+      </div>
+      <div class="tpl-tabs" id="tpl-tabs"></div>
+      <div id="tpl-fields"></div>
+    </section>
+
+    <!-- 编辑模板弹层 -->
+    <section class="card" id="tpl-editor" style="display:none">
+      <h2 id="editor-title">新建模板</h2>
+      <div class="row mb">
+        <div class="grow">
+          <label>模板名称</label>
+          <input type="text" id="ed-name" placeholder="如：简历模板">
+        </div>
+        <div class="grow">
+          <label>模板标识（英文 key，可选）</label>
+          <input type="text" id="ed-key" placeholder="resume">
+        </div>
+      </div>
+      <label>说明</label>
+      <input type="text" id="ed-desc" class="mb" placeholder="这套模板用于什么文档">
+      <h3>字段定义</h3>
+      <div id="ed-fields"></div>
+      <div class="toolbar mt">
+        <button class="btn secondary small" id="btn-field-add">+ 添加字段</button>
+        <button class="btn small" id="btn-tpl-save">保存模板</button>
+        <button class="btn secondary small" id="btn-tpl-cancel">取消</button>
+      </div>
+    </section>
+
+    <!-- 抽取输入 -->
+    <section class="card">
+      <label>输入文本（或从语料库选择）</label>
+      <textarea id="text" rows="9">劳动合同
+
+甲方（发包方）：华云科技有限公司
+乙方：北京数智信息技术有限公司
+
+合同总金额为人民币壹拾贰万元整（小写：120,000元）。
+合同期限：2024年3月1日至2025年2月28日
+签订日期：2024年2月20日
+联系电话：010-88889999
+</textarea>
+      <div class="row mt">
+        <select id="corpus-select" style="max-width:280px"></select>
+        <button class="btn" id="btn-run">抽取字段</button>
+        <button class="btn secondary" id="btn-batch">批量抽取语料库</button>
+        <span class="muted small" id="run-hint"></span>
+      </div>
+    </section>
+
+    <div class="grid cols-2">
+      <!-- 原文高亮 -->
+      <section class="card">
+        <h2>原文回查</h2>
+        <p class="muted small">点击右侧字段值或候选写法，可在原文中定位出处。</p>
+        <div id="highlight" class="output plain" style="font-size:14px;line-height:2;white-space:pre-wrap"></div>
+      </section>
+
+      <!-- 抽取结果 -->
+      <section class="card">
+        <h2>规整字段</h2>
+        <div id="field-result" class="muted">尚未抽取</div>
+      </section>
+    </div>
+
+    <!-- 表格 -->
+    <section class="card" id="table-card" style="display:none">
+      <div class="toolbar">
+        <h2 style="margin:0;flex:1">规整表格</h2>
+        <button class="btn secondary small" id="btn-export">导出 CSV</button>
+      </div>
+      <div style="overflow-x:auto"><table class="gridtbl" id="grid-table"></table></div>
+    </section>
+
+    <!-- 历史 -->
+    <section class="card">
+      <div class="toolbar">
+        <h2 style="margin:0;flex:1">抽取历史</h2>
+        <button class="btn secondary small" id="btn-history-refresh">刷新</button>
+      </div>
+      <div id="history" class="muted">加载中…</div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("extract.html");
+
+let templates = [], currentTpl = null, lastText = "", lastResult = null;
+let editingId = null;   // null=新建，否则为正在编辑的模板记录 id
+const FIELD_TYPES = ["text","person","org","phone","email","money","date","daterange","address","list","section"];
+const TYPE_LABELS = { text:"文本", person:"人名", org:"机构", phone:"电话", email:"邮箱",
+  money:"金额", date:"日期", daterange:"期限", address:"地址", list:"列表", section:"段落区块" };
+const STATUS_LABELS = { found:"命中", inferred:"推断", ambiguous:"歧义", missing:"缺失" };
+
+/* ---------- 模板列表 ---------- */
+async function loadTemplates(selectKey) {
+  const r = await api("/api/extract/templates");
+  templates = r.templates;
+  const tabs = $("#tpl-tabs");
+  tabs.innerHTML = templates.map(t =>
+    `<span class="tpl-tab${currentTpl && currentTpl.id === t.id ? " active" : ""}" data-id="${t.id}">${esc(t.name)}<small class="muted"> v${t.version}</small></span>`
+  ).join("");
+  $$(".tpl-tab", tabs).forEach(el => el.onclick = () => {
+    currentTpl = templates.find(t => t.id === el.dataset.id);
+    renderTemplate();
+  });
+  if (!currentTpl && templates.length) currentTpl = templates[0];
+  if (selectKey) {
+    const t = templates.find(x => x.key === selectKey || x.id === selectKey);
+    if (t) currentTpl = t;
+  }
+  renderTemplate();
+}
+
+function renderTemplate() {
+  $$(".tpl-tab").forEach(el => el.classList.toggle("active",
+      currentTpl && el.dataset.id === currentTpl.id));
+  if (!currentTpl) { $("#tpl-fields").innerHTML = '<span class="muted small">暂无模板</span>';
+                     $("#tpl-meta").textContent = ""; return; }
+  const t = currentTpl;
+  $("#tpl-meta").textContent = `v${t.version} · ${t.template.fields.length} 个字段${t.built_in ? " · 内置" : ""}`;
+  $("#tpl-fields").innerHTML = t.template.fields.map(f => `
+    <span class="field-chip">
+      <b>${esc(f.name)}</b>
+      <span class="muted">${f.key}</span>
+      <span class="badge blue">${TYPE_LABELS[f.type] || f.type}</span>
+      ${f.required ? '<span class="badge amber">必填</span>' : ""}
+      ${f.multi ? '<span class="badge green">多值</span>' : ""}
+    </span>`).join("");
+}
+
+/* ---------- 模板编辑器 ---------- */
+function fieldRowHtml(f = {}) {
+  const typeOpts = FIELD_TYPES.map(t =>
+    `<option value="${t}"${f.type === t ? " selected" : ""}>${TYPE_LABELS[t]}</option>`).join("");
+  return `<div class="field-row">
+    <input type="text" class="f-name" placeholder="字段名（如：合同金额）" value="${esc(f.name || "")}">
+    <select class="f-type">${typeOpts}</select>
+    <input type="text" class="f-labels" placeholder="标签别名，逗号分隔（合同金额,金额,价款）" value="${esc((f.labels || []).join(","))}">
+    <label class="small"><input type="checkbox" class="f-req" ${f.required ? "checked" : ""}> 必填</label>
+    <label class="small"><input type="checkbox" class="f-multi" ${f.multi ? "checked" : ""}> 多值</label>
+    <button class="btn secondary small f-del">删</button>
+  </div>`;
+}
+
+function openEditor(tpl) {
+  editingId = tpl ? tpl.id : null;
+  $("#editor-title").textContent = tpl ? `编辑模板：${tpl.name}` : "新建模板";
+  $("#tpl-editor").style.display = "";
+  $("#ed-name").value = tpl ? tpl.name : "";
+  $("#ed-key").value = tpl ? (tpl.key || "") : "";
+  $("#ed-key").disabled = !!tpl;
+  $("#ed-desc").value = tpl ? (tpl.description || "") : "";
+  const fields = tpl ? tpl.template.fields : [];
+  $("#ed-fields").innerHTML = fields.map(fieldRowHtml).join("") || fieldRowHtml();
+  bindFieldRows();
+}
+
+function bindFieldRows() {
+  $$("#ed-fields .f-del").forEach(btn => btn.onclick = () => {
+    btn.closest(".field-row").remove();
+  });
+}
+
+function collectEditor() {
+  const name = $("#ed-name").value.trim();
+  if (!name) throw new Error("模板名称不能为空");
+  const fields = $$("#ed-fields .field-row").map(row => {
+    const fname = $(".f-name", row).value.trim();
+    if (!fname) throw new Error("存在未命名的字段");
+    return {
+      key: null, name: fname,
+      type: $(".f-type", row).value,
+      labels: $(".f-labels", row).value.split(/[,，]/).map(s => s.trim()).filter(Boolean),
+      required: $(".f-req", row).checked,
+      multi: $(".f-multi", row).checked,
+    };
+  });
+  if (!fields.length) throw new Error("至少定义一个字段");
+  // key 缺省：ASCII 名直接用，否则按 field_N 兜底；同时去重
+  const used = new Set();
+  fields.forEach((f, i) => {
+    let k = `field_${i + 1}`;
+    while (used.has(k)) k = k + "_" + Math.random().toString(36).slice(2, 6);
+    f.key = k;
+    used.add(k);
+  });
+  return { name, key: $("#ed-key").value.trim() || null,
+           description: $("#ed-desc").value.trim(), fields };
+}
+
+$("#btn-field-add").onclick = () => {
+  $("#ed-fields").insertAdjacentHTML("beforeend", fieldRowHtml());
+  bindFieldRows();
+};
+$("#btn-tpl-new").onclick = () => openEditor(null);
+$("#btn-tpl-edit").onclick = () => currentTpl ? openEditor(currentTpl) : toast("请先选择模板", "err");
+$("#btn-tpl-cancel").onclick = () => $("#tpl-editor").style.display = "none";
+$("#btn-tpl-save").onclick = async () => {
+  let payload;
+  try { payload = collectEditor(); } catch (e) { return toast(e.message, "err"); }
+  try {
+    if (editingId) {
+      await api(`/api/extract/templates/${editingId}`, { method: "PUT", body: payload });
+      toast("模板已更新（字段变更将产生新版本）");
+    } else {
+      await api("/api/extract/templates", { method: "POST", body: payload });
+      toast("模板已创建");
+    }
+    $("#tpl-editor").style.display = "none";
+    await loadTemplates(payload.key);
+  } catch (e) { toast(e.message, "err"); }
+};
+$("#btn-tpl-del").onclick = async () => {
+  if (!currentTpl) return;
+  if (!confirm(`确定删除模板「${currentTpl.name}」？已有抽取结果保留。`)) return;
+  await api(`/api/extract/templates/${currentTpl.id}`, { method: "DELETE" });
+  currentTpl = null;
+  await loadTemplates();
+};
+
+/* ---------- 抽取 ---------- */
+async function loadCorpusOptions() {
+  const r = await api("/api/corpus");
+  const sel = $("#corpus-select");
+  sel.innerHTML = '<option value="">— 直接用左侧文本 —</option>' +
+    r.corpora.map(c => `<option value="${c.id}">${esc(c.name)}（${c.length}字）</option>`).join("");
+}
+$("#corpus-select").onchange = async function () {
+  if (!this.value) return;
+  const c = await api(`/api/corpus/${this.value}`);
+  $("#text").value = c.text;
+};
+
+async function doExtract() {
+  const text = $("#text").value.trim();
+  if (!text) return toast("请输入文本", "err");
+  if (!currentTpl) return toast("请先选择模板", "err");
+  const btn = $("#btn-run");
+  setLoading(btn, true, "抽取中…");
+  try {
+    const cid = $("#corpus-select").value || null;
+    const r = await api("/api/extract/run", {
+      method: "POST",
+      body: { text, template_id: currentTpl.id, corpus_id: cid, save: true },
+    });
+    lastText = text;
+    lastResult = r.result;
+    renderHighlight();
+    renderFields();
+    await renderTable(r.result.id);
+    loadHistory();
+    const miss = r.result.missing.length, amb = r.result.ambiguous.length;
+    $("#run-hint").textContent = miss || amb
+      ? `缺失 ${miss} 项${amb ? `，歧义 ${amb} 项` : ""}（已标记，未填错值）`
+      : "全部字段已抽取";
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+$("#btn-run").onclick = doExtract;
+
+$("#btn-batch").onclick = async () => {
+  if (!currentTpl) return toast("请先选择模板", "err");
+  if (!confirm("将对语料库全部文档批量抽取，结果逐篇保存，继续？")) return;
+  const btn = $("#btn-batch");
+  setLoading(btn, true, "批量抽取中…");
+  try {
+    const r = await api("/api/extract/batch", {
+      method: "POST", body: { template_id: currentTpl.id },
+    });
+    toast(`完成：成功 ${r.succeeded}，失败 ${r.failed}`);
+    await renderTable();
+    loadHistory();
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+};
+
+/* ---------- 原文高亮 ---------- */
+function allEvidence() {
+  const ev = [];
+  if (!lastResult) return ev;
+  Object.entries(lastResult.fields).forEach(([key, f]) => {
+    (f.candidates || []).forEach(c => (c.evidence || []).forEach(e => {
+      ev.push({ ...e, field: key, status: f.status });
+    }));
+  });
+  return ev;
+}
+
+function renderHighlight() {
+  const evs = allEvidence()
+    .filter(e => e.source === "anchor" || e.source === "regex")
+    .sort((a, b) => a.start - b.start);
+  let html = "", last = 0;
+  // 防止重叠导致标签错乱
+  for (const e of evs) {
+    if (e.start < last) continue;
+    html += esc(lastText.slice(last, e.start));
+    const cls = e.status === "ambiguous" ? "ent-MONEY"
+      : e.status === "missing" ? "" : "ent-PERSON";
+    html += `<span class="${cls}" data-s="${e.start}" data-e="${e.end}"
+              style="background:#eef1ff;border-radius:3px;padding:0 2px"
+              title="${esc(e.field)} · ${STATUS_LABELS[e.status] || e.status}">
+              ${esc(lastText.slice(e.start, e.end))}</span>`;
+    last = e.end;
+  }
+  html += esc(lastText.slice(last));
+  $("#highlight").innerHTML = html;
+}
+
+function locate(start, end) {
+  const host = $("#highlight");
+  $$("mark.flash", host).forEach(m => {
+    const tn = document.createTextNode(m.textContent);
+    m.replaceWith(tn);
+  });
+  const span = [...host.querySelectorAll("span")].find(s =>
+    +s.dataset.s === start && +s.dataset.e === end) ||
+    findTextSpan(host, lastText.slice(start, end), start);
+  if (!span) return;
+  span.scrollIntoView({ behavior: "smooth", block: "center" });
+  span.style.outline = "2px solid #f59e0b";
+  setTimeout(() => span.style.outline = "", 1500);
+}
+
+function findTextSpan() { return null; }
+
+/* ---------- 字段结果 ---------- */
+function fmtVal(v) {
+  if (v == null) return "";
+  if (Array.isArray(v)) return v.map(fmtVal).join("、");
+  if (typeof v === "object") return esc(v.text || JSON.stringify(v));
+  return esc(v);
+}
+
+function renderFields() {
+  const host = $("#field-result");
+  const tpl = lastResult.template_snapshot;
+  host.innerHTML = tpl.fields.map(spec => {
+    const f = lastResult.fields[spec.key];
+    const st = f.status;
+    let body;
+    if (st === "missing") {
+      body = '<span class="st-missing">【缺失】文本中未找到该字段</span>';
+    } else if (st === "ambiguous") {
+      body = '<span class="st-ambiguous">【歧义】请人工确认：</span><br>' +
+        f.candidates.map(c => evidenceLinks(c)).join("<br>");
+    } else {
+      const c0 = f.candidates[0];
+      body = `<span class="st-${st}">${fmtVal(f.value)}</span>` +
+        (st === "inferred" ? ' <span class="src-tag">全文推断</span>' : "") +
+        (f.raw_variants && f.raw_variants.length > 1
+          ? ` <span class="muted small">写法：${f.raw_variants.map(esc).join(" / ")}</span>` : "");
+      body += "<br><span class='muted small'>出处：</span>" + evidenceLinks(c0);
+      if (f.candidates.length > 1) {
+        body += "<br><span class='muted small'>其它取值：</span>" +
+          f.candidates.slice(1).map(evidenceLinks).join("，");
+      }
+    }
+    return `<div style="padding:8px 0;border-bottom:1px solid var(--border)">
+      <div><b>${esc(spec.name)}</b> <span class="muted small">${spec.key} · ${TYPE_LABELS[spec.type] || spec.type}</span>
+        <span class="badge ${st === "found" ? "green" : st === "inferred" ? "amber" : "red"}">${STATUS_LABELS[st]}</span>
+        ${spec.required ? '<span class="badge amber">必填</span>' : ""}
+      </div>
+      <div class="small mt">${body}</div>
+    </div>`;
+  }).join("");
+}
+
+function evidenceLinks(cand) {
+  const variants = (cand.evidence || []).map((e, i) =>
+    `<a class="field-val" data-s="${e.start}" data-e="${e.end}">${esc(e.text)}</a>` +
+    `<span class="src-tag">${{anchor:"标签",type:"类型",ner:"实体",regex:"正则"}[e.source] || e.source}</span>`
+  ).join("，");
+  return variants || esc(cand.text || "");
+}
+
+$("#field-result").addEventListener("click", e => {
+  const a = e.target.closest(".field-val");
+  if (a) locate(+a.dataset.s, +a.dataset.e);
+});
+
+/* ---------- 表格 ---------- */
+async function renderTable() {
+  if (!currentTpl) return;
+  const r = await api(`/api/extract/results/all/table?template_key=${encodeURIComponent(currentTpl.key || currentTpl.id)}`);
+  if (!r.rows.length) { $("#table-card").style.display = "none"; return; }
+  $("#table-card").style.display = "";
+  const heads = ["语料"].concat(r.columns.map(k => {
+    const meta = r.field_meta[k] || {};
+    return esc(meta.name || k);
+  }));
+  let html = "<thead><tr>" + heads.map(h => `<th>${h}</th>`).join("") + "</tr></thead><tbody>";
+  html += r.rows.map(row => "<tr>" + ["<td class='muted small'>" + esc(row._corpus_id || row._id) + "</td>"]
+    .concat(r.columns.map(k => {
+      const st = (row._status || {})[k];
+      const v = row[k] || "";
+      if (st === "missing") return '<td><span class="st-missing">【缺失】</span></td>';
+      if (st === "ambiguous") return '<td><span class="st-ambiguous">【歧义】</span> ' + esc(v) + "</td>";
+      return `<td><span class="st-${st}">${esc(v)}</span></td>`;
+    })).join("") + "</tr>").join("");
+  $("#grid-table").innerHTML = html + "</tbody>";
+}
+
+$("#btn-export").onclick = () => {
+  if (!currentTpl) return;
+  location.href = `/api/extract/results/all/export?template_key=${encodeURIComponent(currentTpl.key || currentTpl.id)}`;
+};
+
+/* ---------- 历史 ---------- */
+async function loadHistory() {
+  const r = await api("/api/extract/results?order_by=created_at&limit=30");
+  const host = $("#history");
+  if (!r.records.length) { host.innerHTML = '<span class="muted">暂无抽取记录</span>'; return; }
+  host.innerHTML = r.records.map(rec => `
+    <div class="list-item">
+      <div class="meta">
+        <div class="name">${esc(rec.text.slice(0, 50))}${rec.text.length > 50 ? "…" : ""}</div>
+        <div class="sub">
+          模板 ${esc(rec.template_key || rec.template_id)} v${rec.template_version} ·
+          ${rec.complete ? '<span class="st-found">完整</span>'
+            : `缺失 ${rec.missing.length} / 歧义 ${rec.ambiguous.length}`}
+          · ${fmtTime(rec.created_at)}
+          <a href="#" data-id="${rec.id}" class="lnk-recheck">查看</a>
+          <a href="#" data-id="${rec.id}" class="lnk-del">删除</a>
+          <a href="/api/extract/results/${rec.id}/export">CSV</a>
+        </div>
+      </div>
+    </div>`).join("");
+}
+
+$("#history").addEventListener("click", async e => {
+  const del = e.target.closest(".lnk-del");
+  const recheck = e.target.closest(".lnk-recheck");
+  if (del) {
+    e.preventDefault();
+    await api(`/api/extract/results/${del.dataset.id}`, { method: "DELETE" });
+    loadHistory();
+  } else if (recheck) {
+    e.preventDefault();
+    const rec = await api(`/api/extract/results/${recheck.dataset.id}`);
+    // 切换到该结果对应的模板（找不到则保留当前）
+    const t = templates.find(x => x.id === rec.template_id);
+    if (t) { currentTpl = t; renderTemplate(); }
+    lastText = rec.text; lastResult = rec.result;
+    $("#text").value = rec.text;
+    renderHighlight(); renderFields();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+});
+$("#btn-history-refresh").onclick = loadHistory;
+
+/* ---------- 初始化 ---------- */
+(async function init() {
+  await loadTemplates();
+  await loadCorpusOptions();
+  await loadHistory();
+  doExtract();
+})();
+</script>
+</body>
+</html>

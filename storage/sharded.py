@@ -255,6 +255,33 @@ class ShardedStore:
                 return False
         return True
 
+    # -- 更新 -------------------------------------------------------------
+    def update(self, record_id: str, changes: dict) -> Optional[dict]:
+        """按 id 原地更新记录（合并 ``changes``），返回更新后的记录。
+
+        保持 id 与所在分片不变，适用于「版本递增但身份不变」的对象
+        （例如字段模板调整后版本号 +1，旧引用仍然有效）。
+        找不到记录返回 ``None``。
+        """
+        if not isinstance(changes, dict):
+            raise TypeError("changes 必须是 dict")
+        with FileLock(lock_path_for(self.meta_path)):
+            meta = self._read_meta()
+            for index in range(meta.get("shard_count", 0)):
+                path = self._shard_path(index)
+                with FileLock(lock_path_for(path)):
+                    records = self._read_shard(index)
+                    for i, record in enumerate(records):
+                        if record.get("id") == record_id \
+                                and not record.get("_deleted"):
+                            updated = dict(record)
+                            updated.update(changes)
+                            updated["id"] = record_id
+                            records[i] = updated
+                            self._write_shard(index, records)
+                            return updated
+        return None
+
     # -- 删除（墓碑） -----------------------------------------------------
     def delete(self, record_id: str) -> bool:
         with FileLock(lock_path_for(self.meta_path)):

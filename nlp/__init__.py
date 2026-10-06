@@ -16,16 +16,21 @@ from .summarizer import Summarizer
 from .translator import Translator
 from .keywords import KeywordExtractor
 from .embeddings import WordEmbeddings
+from .extraction import (TemplateExtractor, FieldTemplate, FieldSpec,
+                         FIELD_TYPE_NAMES, BUILTIN_TEMPLATES, get_builtin_templates)
 from . import lexicon, text, hmm
 
 __all__ = [
     "Segmenter", "POSTagger", "DependencyParser", "ConstituencyParser",
     "NERExtractor", "SentimentAnalyzer", "Summarizer", "Translator",
     "KeywordExtractor", "WordEmbeddings",
+    "TemplateExtractor", "FieldTemplate", "FieldSpec",
     "TAG_NAMES", "TAGSET", "DEP_REL_NAMES", "PHRASE_NAMES", "ENTITY_TYPE_NAMES",
-    "POLARITY_NAMES", "lexicon", "text", "hmm",
+    "POLARITY_NAMES", "FIELD_TYPE_NAMES", "BUILTIN_TEMPLATES",
+    "lexicon", "text", "hmm",
     "get_segmenter", "get_tagger", "get_parser", "get_ner", "get_sentiment",
     "get_summarizer", "get_translator", "get_keywords", "get_embeddings",
+    "get_extractor", "get_builtin_templates",
 ]
 
 
@@ -78,3 +83,7 @@ def get_keywords() -> KeywordExtractor:
 
 def get_embeddings() -> WordEmbeddings:
     return _singleton("embeddings", WordEmbeddings)
+
+
+def get_extractor() -> TemplateExtractor:
+    return _singleton("extractor", TemplateExtractor)

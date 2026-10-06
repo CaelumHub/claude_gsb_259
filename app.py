@@ -41,6 +41,11 @@ def create_app(data_root: str | None = None) -> Flask:
 
     app.register_blueprint(api)
 
+    # 首次使用植入内置字段模板（简历/合同/通知）
+    with app.app_context():
+        from web.routes import seed_builtin_templates
+        seed_builtin_templates()
+
     # 页面路由
     @app.get("/")
     def index():

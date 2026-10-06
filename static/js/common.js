@@ -7,6 +7,7 @@ const PAGES = [
   { file: "segment.html",   name: "分词与词性标注", desc: "切词 + POS" },
   { file: "parse.html",     name: "句法分析树",   desc: "依存 / 成分树" },
   { file: "ner.html",       name: "命名实体识别", desc: "NER 与标注" },
+  { file: "extract.html",   name: "字段抽取",     desc: "模板填充表格" },
   { file: "sentiment.html", name: "情感分析",     desc: "正负面分类" },
   { file: "summary.html",   name: "文本摘要",     desc: "抽取式摘要" },
   { file: "translate.html", name: "机器翻译",     desc: "模拟翻译" },
@@ -17,7 +18,7 @@ const PAGES = [
 
 const PAGE_NAMES = {
   corpus: "语料库管理", segment: "分词与词性标注", parse: "句法分析树",
-  ner: "命名实体识别", sentiment: "情感分析", summary: "文本摘要",
+  ner: "命名实体识别", extract: "模板化字段抽取", sentiment: "情感分析", summary: "文本摘要",
   translate: "机器翻译", keywords: "关键词提取", embedding: "词向量可视化",
   pipeline: "流水线配置与执行",
 };
