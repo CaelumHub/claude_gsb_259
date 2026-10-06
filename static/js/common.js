@@ -7,6 +7,7 @@ const PAGES = [
   { file: "segment.html",   name: "分词与词性标注", desc: "切词 + POS" },
   { file: "parse.html",     name: "句法分析树",   desc: "依存 / 成分树" },
   { file: "ner.html",       name: "命名实体识别", desc: "NER 与标注" },
+  { file: "extract.html",   name: "信息抽取",     desc: "模板字段抽取" },
   { file: "sentiment.html", name: "情感分析",     desc: "正负面分类" },
   { file: "summary.html",   name: "文本摘要",     desc: "抽取式摘要" },
   { file: "translate.html", name: "机器翻译",     desc: "模拟翻译" },

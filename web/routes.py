@@ -18,11 +18,23 @@ from nlp import (get_constituency_parser, get_embeddings, get_keywords, get_ner,
                  get_parser, get_segmenter, get_sentiment, get_summarizer,
                  get_tagger, get_translator, ENTITY_TYPE_NAMES, TAG_NAMES,
                  DEP_REL_NAMES, PHRASE_NAMES, POLARITY_NAMES)
+from nlp.extractor import FIELD_TYPES, TemplateError
 from nlp.lexicon import STOPWORDS
+from ie import InfoExtractionService
 from storage import StoreRegistry
 
 
 api = Blueprint("api", __name__, url_prefix="/api")
+
+
+def _ie_service() -> InfoExtractionService:
+    """惰性单例：首次访问时写入预置模板（简历/合同/通知）。"""
+    svc = current_app.config.get("IE_SERVICE")
+    if svc is None:
+        svc = InfoExtractionService(_registry())
+        svc.seed_builtins()
+        current_app.config["IE_SERVICE"] = svc
+    return svc
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +579,229 @@ def get_pipeline_run(run_id: str):
 
 
 # ---------------------------------------------------------------------------
+# 信息抽取：模板版本管理 + 字段抽取 + 结果回查 / 导出
+# ---------------------------------------------------------------------------
+
+@api.get("/ie/meta")
+def ie_meta():
+    return jsonify({"field_types": FIELD_TYPES,
+                    "extractor_version": _ie_service().extractor.__class__.__name__})
+
+
+@api.get("/ie/templates")
+def ie_list_templates():
+    include = request.args.get("versions") in ("1", "true", "yes")
+    return jsonify({"templates": _ie_service().list_templates(include)})
+
+
+@api.get("/ie/templates/<tpl_id>")
+def ie_get_template(tpl_id: str):
+    version = request.args.get("version", type=int)
+    rec = _ie_service().get_template(tpl_id, version)
+    if not rec:
+        return jsonify({"error": "模板不存在"}), 404
+    return jsonify(rec)
+
+
+@api.post("/ie/templates")
+def ie_create_template():
+    data = _payload()
+    spec = {"name": data.get("name", ""),
+            "description": data.get("description", ""),
+            "fields": data.get("fields", [])}
+    try:
+        rec = _ie_service().create_template(spec, tpl_id=data.get("template_id"))
+    except TemplateError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, "template": _ie_public_template(rec)})
+
+
+@api.post("/ie/templates/<tpl_id>/versions")
+def ie_new_version(tpl_id: str):
+    """调整字段后另存为新版本，已有结果一律保留不动。"""
+    data = _payload()
+    spec = {"name": data.get("name", ""),
+            "description": data.get("description", ""),
+            "fields": data.get("fields", [])}
+    try:
+        rec = _ie_service().new_version(tpl_id, spec, note=data.get("note", ""))
+    except TemplateError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, "template": _ie_public_template(rec)})
+
+
+@api.delete("/ie/templates/<tpl_id>")
+def ie_delete_template(tpl_id: str):
+    rec = _ie_service().get_template(tpl_id)
+    if rec and rec.get("builtin"):
+        return jsonify({"error": "预置模板不可删除，可在其基础上另存新版本"}), 400
+    ok = _ie_service().delete_template(tpl_id)
+    return jsonify({"ok": ok})
+
+
+def _ie_public_template(rec: dict) -> dict:
+    return {
+        "template_id": rec["template_id"], "version": rec["version"],
+        "name": rec["name"], "description": rec.get("description", ""),
+        "fields": rec["fields"], "builtin": rec.get("builtin", False),
+        "created_at": rec.get("created_at"),
+    }
+
+
+def _ie_resolve_docs(data: dict) -> list[dict]:
+    """支持：直接 text；单个 corpus_id；corpus_ids 批量。"""
+    docs: list[dict] = []
+    if data.get("text"):
+        docs.append({"text": data["text"],
+                     "doc_name": data.get("doc_name"),
+                     "corpus_id": data.get("corpus_id")})
+    store = _registry().task("corpus")
+    if data.get("corpus_id") and not data.get("text"):
+        rec = store.get(data["corpus_id"])
+        if rec:
+            docs.append({"text": rec.get("text", ""),
+                         "doc_name": rec.get("name"),
+                         "corpus_id": data["corpus_id"]})
+    for cid in data.get("corpus_ids", []) or []:
+        rec = store.get(cid)
+        if rec:
+            docs.append({"text": rec.get("text", ""),
+                         "doc_name": rec.get("name"), "corpus_id": cid})
+    return docs
+
+
+@api.post("/ie/extract")
+def ie_extract():
+    data = _payload()
+    tpl_id = data.get("template_id")
+    if not tpl_id:
+        return jsonify({"error": "请选择抽取模板"}), 400
+    docs = _ie_resolve_docs(data)
+    docs = [d for d in docs if d["text"].strip()]
+    if not docs:
+        return jsonify({"error": "缺少待抽取文本"}), 400
+    version = data.get("version")
+    version = int(version) if version not in (None, "") else None
+    svc = _ie_service()
+    upsert = bool(data.get("upsert", True))
+    batch_mode = bool(data.get("batch")) or bool(data.get("corpus_ids"))
+    try:
+        if len(docs) == 1 and not batch_mode:
+            if data.get("save") is False:
+                # 只抽取不落库
+                tpl = svc.get_template(tpl_id, version)
+                if not tpl:
+                    return jsonify({"error": "模板不存在"}), 404
+                result = svc.extractor.extract(
+                    docs[0]["text"],
+                    {"name": tpl["name"], "fields": tpl["fields"]})
+                return jsonify({"ok": True, "saved": False, "result": result})
+            out = svc.extract(docs[0]["text"], tpl_id, version,
+                              corpus_id=docs[0].get("corpus_id"),
+                              doc_name=docs[0].get("doc_name"), upsert=upsert)
+            return jsonify({"ok": True, "id": out["id"],
+                            "replaced": out["replaced"],
+                            "record": _ie_client_record(out["record"])})
+        # 批量
+        summary = svc.extract_batch(docs, tpl_id, version, upsert=upsert)
+        return jsonify({"ok": True, "batch": True, **summary})
+    except TemplateError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@api.post("/ie/preview")
+def ie_preview():
+    """仅试抽取，不落库（配置字段时即时预览）。"""
+    data = _payload()
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "缺少待抽取文本"}), 400
+    # 方式一：指定已有模板（可带版本）
+    if data.get("template_id"):
+        tpl = _ie_service().get_template(
+            data["template_id"],
+            int(data["version"]) if data.get("version") not in (None, "")
+            else None)
+        if not tpl:
+            return jsonify({"error": "模板不存在"}), 404
+    else:
+        # 方式二：直接传字段定义（编辑中尚未保存的模板）
+        tpl = {"name": data.get("name", "预览模板"),
+               "fields": data.get("fields", [])}
+    try:
+        result = _ie_service().extractor.extract(
+            text, {"name": tpl["name"], "fields": tpl["fields"]})
+    except TemplateError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, "result": result})
+
+
+@api.get("/ie/results")
+def ie_results():
+    svc = _ie_service()
+    records = svc.query_results(
+        template_id=request.args.get("template_id"),
+        version=request.args.get("version", type=int),
+        corpus_id=request.args.get("corpus_id"),
+        text_hash_eq=request.args.get("text_hash"))
+    rows = [_ie_client_record(r, include_text=True) for r in records]
+    return jsonify({"count": len(rows), "records": rows})
+
+
+@api.get("/ie/results/<result_id>")
+def ie_get_result(result_id: str):
+    rec = _ie_service().get_result(result_id)
+    if not rec:
+        return jsonify({"error": "抽取结果不存在"}), 404
+    return jsonify(_ie_client_record(rec, include_text=True))
+
+
+@api.delete("/ie/results/<result_id>")
+def ie_delete_result(result_id: str):
+    ok = _ie_service().result_store.delete(result_id)
+    return jsonify({"ok": ok})
+
+
+@api.get("/ie/results/export.csv")
+def ie_export_csv():
+    from flask import Response
+    svc = _ie_service()
+    _v = request.args.get("version")
+    records = svc.query_results(
+        template_id=request.args.get("template_id"),
+        version=int(_v) if _v not in (None, "") else None)
+    content = svc.export_csv(records)
+    resp = Response(content.encode("utf-8-sig"),
+                    mimetype="text/csv; charset=utf-8")
+    fname = f"ie_export_{int(time.time())}.csv"
+    resp.headers["Content-Disposition"] = f"attachment; filename={fname}"
+    return resp
+
+
+def _ie_client_record(rec: dict, include_text: bool = False) -> dict:
+    """结果给前端时的精简形态。"""
+    out = {
+        "id": rec["id"],
+        "template_id": rec["template_id"],
+        "template_version": rec["template_version"],
+        "template_name": rec["template_name"],
+        "missing": rec["missing"],
+        "missing_required": rec["missing_required"],
+        "conflicts": rec["conflicts"],
+        "doc_name": rec.get("doc_name"),
+        "corpus_id": rec.get("corpus_id"),
+        "text_hash": rec.get("text_hash"),
+        "created_at": rec.get("created_at"),
+        "result": rec["result"],
+        "template_snapshot": rec.get("template_snapshot"),
+    }
+    if include_text:
+        out["text"] = rec.get("text", "")
+        out["text_length"] = len(rec.get("text", ""))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 结果查询（分片合并与查询）
 # ---------------------------------------------------------------------------
 
@@ -575,7 +810,8 @@ def list_result_tasks():
     registry = _registry()
     tasks = []
     for name in registry.tasks():
-        if name in ("corpus", "pipeline_config", "annotation"):
+        if name in ("corpus", "pipeline_config", "annotation",
+                    "ie_template", "ie_result"):
             continue
         stats = registry.task(name).stats()
         tasks.append(stats)

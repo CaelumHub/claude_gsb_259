@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>信息抽取 - NLP 流水线平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
+    .tab-btn { padding: 10px 18px; background: none; border: none; border-bottom: 2px solid transparent;
+      font-size: 14px; color: var(--text-muted); cursor: pointer; font-weight: 600; }
+    .tab-btn.active { color: var(--primary); border-bottom-color: var(--primary); }
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; }
+
+    .st-found    { color: var(--green, #16a34a); }
+    .st-missing  { color: var(--red, #dc2626); font-weight: 700; }
+    .st-conflict { color: var(--amber, #d97706); font-weight: 700; }
+
+    .src-text { white-space: pre-wrap; word-break: break-all; line-height: 2; font-size: 14px; }
+    .src-mark { background: #fde68a; border-bottom: 2px solid #d97706; border-radius: 3px;
+      cursor: pointer; scroll-margin-top: 80px; }
+    .src-mark.active { background: #f59e0b; box-shadow: 0 0 0 2px #f59e0b55; }
+    .src-mark.miss-target { background: #fecaca; border-bottom-color: #dc2626; }
+
+    .mention-chip { display: inline-block; margin: 2px 4px 2px 0; padding: 2px 8px; border-radius: 6px;
+      background: var(--primary-soft); color: var(--primary); font-size: 12px; cursor: pointer; }
+    .mention-chip .mth { opacity: .65; margin-left: 4px; }
+
+    table.fields td, table.fields th { vertical-align: top; }
+    table.fields .col-key { width: 110px; font-weight: 600; }
+    table.fields .col-val { width: 38%; }
+    table.fields .col-src { width: 110px; }
+
+    .fld-editor { border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin-bottom: 10px; background: var(--surface-2, #f8fafc); }
+    .fld-editor .row > div { min-width: 130px; }
+    .hint { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+    .vtag { display: inline-block; background: #eef2ff; border: 1px solid #c7d2fe; color: var(--primary);
+      border-radius: 6px; padding: 1px 8px; font-size: 12px; margin: 2px 4px 2px 0; }
+    .vtag.miss { background: #fef2f2; border-color: #fecaca; color: var(--red, #dc2626); }
+    .vtag.conf { background: #fffbeb; border-color: #fde68a; color: #b45309; }
+    .mini { font-size: 12px; }
+    .mono { font-family: var(--mono, monospace); }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">信息抽取</h1>
+    <p class="page-desc">按自定义字段模板（简历 / 合同 / 通知）把半结构化文本抽成规整记录；缺失显式标出、多值冲突保留全部候选，每处结果可回溯原文。</p>
+
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="extract">① 抽取与回查</button>
+      <button class="tab-btn" data-tab="templates">② 模板管理（多版本）</button>
+      <button class="tab-btn" data-tab="results">③ 抽取结果台账</button>
+    </div>
+
+    <!-- ================= Tab 1: 抽取 ================= -->
+    <section class="tab-pane active" id="tab-extract">
+      <div class="grid cols-2">
+        <div>
+          <section class="card">
+            <div class="toolbar">
+              <div class="grow" style="min-width:220px">
+                <label>抽取模板</label>
+                <select id="ex-tpl"></select>
+              </div>
+              <div style="width:120px">
+                <label>版本</label>
+                <select id="ex-version"></select>
+              </div>
+            </div>
+            <label>待抽取文本</label>
+            <textarea id="ex-text" style="min-height:260px">房屋租赁合同
+甲方（出租方）：北京安居物业管理有限公司
+乙方（承租方）：张伟
+根据相关法律规定，双方就房屋租赁事宜达成协议如下。
+第一条 租赁标的：朝阳区幸福小区3号楼501室。
+第二条 合同期限：自2024年1月1日起至2026年12月31日止。
+第三条 合同总金额为人民币壹拾贰万元整（小写：120,000元），按年度支付。
+签订日期：2023年12月20日
+甲方（盖章）：北京安居物业管理有限公司
+乙方（签字）：张伟</textarea>
+            <div class="row mt">
+              <button class="btn" id="btn-run">开始抽取</button>
+              <button class="btn secondary" id="btn-preview">试抽取（不保存）</button>
+              <span class="hint" id="ex-saved"></span>
+            </div>
+          </section>
+
+          <section class="card">
+            <h2>原文回查（点击右侧字段/命中可定位）</h2>
+            <div class="src-text" id="ex-source">尚未抽取。</div>
+          </section>
+        </div>
+
+        <div>
+          <section class="card">
+            <h2>规整记录</h2>
+            <div id="ex-summary" class="mini" style="margin-bottom:10px"></div>
+            <table class="data fields">
+              <thead><tr><th>字段</th><th>值</th><th>状态</th><th>原文出处</th></tr></thead>
+              <tbody id="ex-fields">
+                <tr><td colspan="4" class="hint">抽取结果将显示在这里。</td></tr>
+              </tbody>
+            </table>
+          </section>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= Tab 2: 模板 ================= -->
+    <section class="tab-pane" id="tab-templates">
+      <div class="grid cols-2">
+        <section class="card">
+          <h2>已有模板</h2>
+          <div class="toolbar">
+            <select id="tpl-pick" style="max-width:260px"></select>
+            <select id="tpl-version" style="width:110px"></select>
+            <button class="btn small secondary" id="btn-load-version">载入此版本</button>
+            <button class="btn small" id="btn-new-blank">＋ 新建模板</button>
+          </div>
+          <div id="tpl-info" class="hint"></div>
+          <table class="data mt" id="tpl-fields-view"></table>
+        </section>
+
+        <section class="card">
+          <h2 id="tpl-editor-title">模板编辑器</h2>
+          <label>模板名称</label>
+          <input type="text" id="tpl-name" placeholder="例如：录用通知书">
+          <label class="mt">说明</label>
+          <input type="text" id="tpl-desc" placeholder="这个模板用于什么场景">
+          <div class="toolbar mt">
+            <h3 style="margin:0;flex:1">字段定义</h3>
+            <button class="btn small secondary" id="btn-add-field">＋ 添加字段</button>
+          </div>
+          <div id="field-editors"></div>
+          <div class="row mt">
+            <button class="btn" id="btn-save-new">保存为新模板</button>
+            <button class="btn secondary" id="btn-save-version">另存为新版本</button>
+            <button class="btn danger" id="btn-delete-tpl" style="display:none">删除模板</button>
+            <button class="btn secondary" id="btn-tpl-preview">用左侧文本试抽取</button>
+          </div>
+          <div class="hint" id="tpl-save-msg"></div>
+        </section>
+      </div>
+    </section>
+
+    <!-- ================= Tab 3: 结果台账 ================= -->
+    <section class="tab-pane" id="tab-results">
+      <section class="card">
+        <div class="toolbar">
+          <label style="margin:0">模板</label>
+          <select id="rs-tpl" style="width:200px"></select>
+          <label style="margin:0">版本</label>
+          <select id="rs-version" style="width:110px"></select>
+          <button class="btn small secondary" id="btn-rs-refresh">刷新</button>
+          <span class="grow"></span>
+          <a class="btn small" id="btn-export-csv" href="#">导出 CSV 表格</a>
+          <button class="btn small secondary" id="btn-rs-tab1">在回查页打开选中</button>
+        </div>
+        <table class="data">
+          <thead><tr>
+            <th>文档</th><th>模板/版本</th><th>缺失字段</th><th>冲突字段</th><th>抽取时间</th><th>操作</th>
+          </tr></thead>
+          <tbody id="rs-rows"><tr><td colspan="6" class="hint">暂无记录。</td></tr></tbody>
+        </table>
+      </section>
+    </section>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("extract.html");
+
+const FIELD_TYPES = {
+  person: "人名", org: "机构", location: "地名", phone: "电话",
+  email: "邮箱", idcard: "身份证号", money: "金额", date: "日期",
+  text: "文本", list: "条目列表",
+};
+const TYPE_OPTIONS = Object.entries(FIELD_TYPES)
+  .map(([v, n]) => `<option value="${v}">${n}（${v}）</option>`).join("");
+
+let TEMPLATES = [];          // 最新版本列表
+let TPL_VERSIONS = {};       // id -> [versions...]
+let CURRENT_RESULT = null;   // 当前回查页的结果
+let CURRENT_TEXT = "";
+let editingId = null;        // 编辑器当前基于哪个模板
+
+/* ---------------- Tab 切换 ---------------- */
+$$(".tab-btn").forEach(btn => btn.addEventListener("click", () => {
+  $$(".tab-btn").forEach(b => b.classList.remove("active"));
+  $$(".tab-pane").forEach(p => p.classList.remove("active"));
+  btn.classList.add("active");
+  $("#tab-" + btn.dataset.tab).classList.add("active");
+  if (btn.dataset.tab === "templates") loadTemplateTab();
+  if (btn.dataset.tab === "results") loadResultsTab();
+}));
+
+async function loadTemplates() {
+  const r = await api("/api/ie/templates?versions=1");
+  TEMPLATES = r.templates;
+  TPL_VERSIONS = {};
+  r.templates.forEach(t => { TPL_VERSIONS[t.template_id] = t.versions || [t]; });
+  fillTplSelect($("#ex-tpl"), false);
+  fillTplSelect($("#rs-tpl"), true);
+  fillTplSelect($("#tpl-pick"), false);
+}
+function fillTplSelect(sel, withVersion) {
+  sel.innerHTML = TEMPLATES.map(t =>
+    `<option value="${t.template_id}">${t.builtin ? "★ " : ""}${esc(t.name)}（v${t.version}）</option>`
+  ).join("");
+  fillVersionSelect(sel, withVersion ? $("#rs-version") : null);
+}
+function fillVersionSelect(tplSel, verSel) {
+  if (!verSel) return;
+  const vs = TPL_VERSIONS[tplSel.value] || [];
+  verSel.innerHTML = `<option value="">全部</option>` +
+    vs.map(v => `<option value="${v.version}">v${v.version}</option>`).join("");
+}
+$("#ex-tpl").addEventListener("change", () => {
+  const vs = TPL_VERSIONS[$("#ex-tpl").value] || [];
+  $("#ex-version").innerHTML =
+    vs.slice().reverse().map(v => `<option value="${v.version}">v${v.version}${v === TEMPLATES.find(t=>t.template_id===$("#ex-tpl").value) ? "（最新）" : ""}</option>`).join("");
+});
+$("#rs-tpl").addEventListener("change", () => fillVersionSelect($("#rs-tpl"), $("#rs-version")));
+
+/* ---------------- Tab1: 抽取 ---------------- */
+$("#btn-run").addEventListener("click", () => doExtract(false));
+$("#btn-preview").addEventListener("click", () => doExtract(true));
+
+async function doExtract(preview) {
+  const text = $("#ex-text").value.trim();
+  if (!text) return toast("请输入待抽取文本", "err");
+  const btn = preview ? $("#btn-preview") : $("#btn-run");
+  setLoading(btn, true, "抽取中…");
+  try {
+    const body = { text, template_id: $("#ex-tpl").value, version: parseInt($("#ex-version").value) || null };
+    if (preview) body.save = false;
+    const r = await api(preview ? "/api/ie/preview" : "/api/ie/extract", { method: "POST", body });
+    const result = preview ? r.result : r.record.result;
+    const rec = preview
+      ? { result, text, template_name: "试抽取", template_version: "预览", id: null }
+      : { ...r.record, text };
+    renderExtraction(rec);
+    $("#ex-saved").textContent = preview
+      ? "试抽取结果，未保存。"
+      : `已保存为结果 #${r.id}${r.replaced ? "（已替换同文本同版本的旧记录）" : ""}`;
+  } catch (e) { toast(e.message, "err"); }
+  setLoading(btn, false);
+}
+
+function renderExtraction(rec) {
+  CURRENT_RESULT = rec;
+  CURRENT_TEXT = rec.text;
+  const fields = rec.result.fields;
+  const miss = rec.result.missing, conf = rec.result.conflicts;
+  const reqMiss = rec.result.missing_required || [];
+
+  $("#ex-summary").innerHTML =
+    `<span class="vtag">字段 ${Object.keys(fields).length}</span>` +
+    `<span class="vtag ${miss.length ? "miss" : ""}">缺失 ${miss.length}${reqMiss.length ? `（必填 ${reqMiss.length}）` : ""}</span>` +
+    `<span class="vtag ${conf.length ? "conf" : ""}">冲突 ${conf.length}</span>` +
+    `<span class="hint">模板：${esc(rec.template_name)} v${rec.template_version}　值为空且标红 = 原文中没找到，而非抽错</span>`;
+
+  // 原文：先按所有 mention 区间合并高亮
+  const spans = [];
+  Object.entries(fields).forEach(([key, f]) => {
+    (f.mentions || []).forEach(m => spans.push({ ...m, key, label: f.label, status: f.status }));
+  });
+  $("#ex-source").innerHTML = highlightSpans(rec.text, mergeSpans(spans));
+
+  // 字段表
+  const rows = Object.values(fields).map(f => {
+    let valHtml;
+    if (f.status === "missing") {
+      valHtml = `<span class="st-missing">— 缺失 —</span>`;
+    } else if (f.status === "conflict") {
+      valHtml = (f.candidates || []).map(c =>
+        `<span class="vtag conf" title="出现 ${c.count} 次，方式 ${c.methods.join("/")}">${esc(c.raw)}<b> ×${c.count}</b></span>`
+      ).join("") + `<div class="hint st-conflict">多处写法不一致，请人工确认</div>`;
+    } else if (f.multi && Array.isArray(f.value)) {
+      valHtml = "<ol style='margin:4px 0;padding-left:20px'>" +
+        f.value.map(v => `<li>${esc(v)}</li>`).join("") + "</ol>";
+    } else {
+      valHtml = `<b>${esc(f.value)}</b>`;
+      if (f.raw !== f.value && f.raw != null) valHtml += ` <span class="hint">原文：${esc(f.raw)}</span>`;
+    }
+    const chips = (f.mentions || []).map((m, i) =>
+      `<span class="mention-chip" data-key="${esc(f.key)}" data-i="${i}">${esc(m.method)}<span class="mth">${m.start}:${m.end}</span></span>`
+    ).join("") || '<span class="hint">无</span>';
+    const stCls = f.status === "missing" ? "st-missing" : f.status === "conflict" ? "st-conflict" : "st-found";
+    const stTxt = { found: "已抽取", missing: "缺失", conflict: "冲突" }[f.status];
+    return `<tr data-key="${esc(f.key)}">
+      <td class="col-key">${esc(f.label)}${f.required ? ' <span class="st-missing">*</span>' : ""}<div class="hint mono">${esc(f.key)} · ${FIELD_TYPES[f.type] || f.type}</div></td>
+      <td class="col-val">${valHtml}</td>
+      <td class="col-src"><span class="${stCls}">${stTxt}</span></td>
+      <td>${chips}</td>
+    </tr>`;
+  }).join("");
+  $("#ex-fields").innerHTML = rows;
+
+  // 点击出处 chip -> 定位原文
+  $$("#ex-fields .mention-chip").forEach(chip => chip.addEventListener("click", () => {
+    const f = fields[chip.dataset.key];
+    const m = f.mentions[parseInt(chip.dataset.i)];
+    locateMention(f, m);
+  }));
+}
+
+function locateMention(field, m) {
+  $$("#ex-source .src-mark").forEach(el => el.classList.remove("active"));
+  const idx = (field.mentions || []).findIndex(x => x.start === m.start && x.end === m.end);
+  const el = document.querySelector(`#ex-source .src-mark[data-s="${m.start}"][data-e="${m.end}"]`);
+  if (el) {
+    el.classList.add("active");
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    toast(`《${field.label}》出处：「${m.raw}」 方式：${m.method}　上下文：${m.context || ""}`, "ok");
+  }
+}
+
+/* 带偏移高亮：区间合并（重叠时按字段状态着色） */
+function mergeSpans(spans) {
+  const sorted = spans.slice().sort((a, b) => a.start - b.start || b.end - a.end);
+  const out = [];
+  for (const s of sorted) {
+    const last = out[out.length - 1];
+    if (last && s.start < last.end) {
+      if (s.end > last.end) last.parts.push(s);  // 重叠仅登记，不重复渲染
+      else last.parts.push(s);
+      continue;
+    }
+    out.push({ start: s.start, end: s.end, parts: [s] });
+  }
+  return out;
+}
+function highlightSpans(text, spans) {
+  let html = "", last = 0;
+  for (const sp of spans) {
+    html += esc(text.slice(last, sp.start));
+    const titles = sp.parts.map(p => `${p.label}（${p.status}）`).join(" / ");
+    html += `<span class="src-mark" data-s="${sp.start}" data-e="${sp.end}" title="${esc(titles)}">${esc(text.slice(sp.start, sp.end))}</span>`;
+    last = sp.end;
+  }
+  html += esc(text.slice(last));
+  return html;
+}
+
+/* ---------------- Tab2: 模板管理 ---------------- */
+async function loadTemplateTab() {
+  await loadTemplates();
+  loadVersionIntoPicker();
+}
+$("#tpl-pick").addEventListener("change", loadVersionIntoPicker);
+$("#tpl-version").addEventListener("change", () => {
+  // 只切换下拉
+});
+$("#btn-load-version").addEventListener("click", () => {
+  const t = currentTplPick();
+  const v = parseInt($("#tpl-version").value) || t.version;
+  const rec = (TPL_VERSIONS[t.template_id] || []).find(x => x.version === v);
+  if (rec) openEditor(rec);
+});
+$("#btn-new-blank").addEventListener("click", () => {
+  openEditor({ name: "", description: "", fields: [], template_id: null, builtin: false, version: null });
+  editingId = null;
+});
+
+function currentTplPick() {
+  return TEMPLATES.find(t => t.template_id === $("#tpl-pick").value) || {};
+}
+function loadVersionIntoPicker() {
+  const t = currentTplPick();
+  const vs = TPL_VERSIONS[t.template_id] || [];
+  $("#tpl-version").innerHTML = vs.slice().reverse()
+    .map(v => `<option value="${v.version}"${v.version === t.version ? " selected" : ""}>v${v.version}${v.version === t.version ? "（最新）" : ""}</option>`).join("");
+  renderTplInfo(t);
+  if (t.template_id) openEditor(t);  // 默认载入最新版到编辑器
+}
+function renderTplInfo(t) {
+  $("#tpl-info").innerHTML = t.template_id
+    ? `id: <span class="mono">${esc(t.template_id)}</span> · 最新 v${t.version} · 共 ${(TPL_VERSIONS[t.template_id]||[]).length} 个历史版本${t.builtin ? " · ★预置" : ""}`
+    : "";
+  $("#tpl-fields-view").innerHTML = t.fields
+    ? `<thead><tr><th>key</th><th>字段</th><th>类型</th><th>必填</th><th>标签/章节线索</th></tr></thead><tbody>` +
+      t.fields.map(f => `<tr><td class="mono">${esc(f.key)}</td><td>${esc(f.label)}</td><td>${FIELD_TYPES[f.type]||f.type}</td>
+        <td>${f.required ? "是" : ""}</td><td class="hint">${[...(f.aliases||[]),...(f.sections||[])].map(esc).join("、")}</td></tr>`).join("")
+      + "</tbody>"
+    : "";
+}
+
+function openEditor(t) {
+  editingId = t.template_id || null;
+  $("#tpl-editor-title").textContent = editingId
+    ? `模板编辑器 —— ${t.name} v${t.version}（改动请另存新版本）` : "模板编辑器 —— 新建";
+  $("#tpl-name").value = t.name || "";
+  $("#tpl-desc").value = t.description || "";
+  $("#btn-delete-tpl").style.display = t.builtin ? "none" : (editingId ? "" : "none");
+  $("#field-editors").innerHTML = "";
+  (t.fields || []).forEach(f => addFieldRow(f));
+  if (!(t.fields || []).length) addFieldRow();
+  $("#tpl-save-msg").textContent = editingId
+    ? "保存新版本不会修改 v" + t.version + "，历史抽取结果全部保留。" : "";
+}
+
+function addFieldRow(f = {}) {
+  const div = document.createElement("div");
+  div.className = "fld-editor";
+  div.innerHTML = `
+    <div class="row">
+      <div style="flex:1"><label>字段 key（英文）</label><input class="f-key" type="text" value="${esc(f.key||"")}" placeholder="amount"></div>
+      <div style="flex:1"><label>显示名</label><input class="f-label" type="text" value="${esc(f.label||"")}" placeholder="合同金额"></div>
+      <div style="width:140px"><label>类型</label><select class="f-type">${TYPE_OPTIONS}</select></div>
+      <div style="width:90px;padding-top:22px"><label class="hint"><input type="checkbox" class="f-req" ${f.required?"checked":""}> 必填</label></div>
+      <div style="padding-top:22px"><button class="btn small danger f-del">删</button></div>
+    </div>
+    <div class="row mt">
+      <div style="flex:2"><label>同义标签（逗号分隔，如：合同金额,总金额,价款）</label><input class="f-aliases" type="text" value="${esc((f.aliases||[]).join(","))}"></div>
+      <div style="flex:2"><label>章节标题（列表字段用，如：工作经历,项目经验）</label><input class="f-sections" type="text" value="${esc((f.sections||[]).join(","))}"></div>
+      <div style="width:130px"><label>多值</label><select class="f-multi"><option value="" ${f.multi===undefined?"":""}>按类型</option><option value="true" ${f.multi===true?"selected":""}>多条</option><option value="false" ${f.multi===false?"selected":""}>单条</option></select></div>
+      <div style="width:120px"><label>日期取值</label><select class="f-date"><option value="first">区间首个</option><option value="last" ${f.date_order==="last"?"selected":""}>区间末个</option></select></div>
+    </div>`;
+  div.querySelector(".f-type").value = f.type || "text";
+  div.querySelector(".f-del").addEventListener("click", () => div.remove());
+  $("#field-editors").appendChild(div);
+}
+$("#btn-add-field").addEventListener("click", () => addFieldRow());
+
+function collectEditorSpec() {
+  const rows = $$("#field-editors .fld-editor");
+  const fields = rows.map(d => {
+    const multiVal = d.querySelector(".f-multi").value;
+    const f = {
+      key: d.querySelector(".f-key").value.trim(),
+      label: d.querySelector(".f-label").value.trim(),
+      type: d.querySelector(".f-type").value,
+      required: d.querySelector(".f-req").checked,
+      aliases: splitCsv(d.querySelector(".f-aliases").value),
+      sections: splitCsv(d.querySelector(".f-sections").value),
+      date_order: d.querySelector(".f-date").value,
+    };
+    if (multiVal === "true") f.multi = true;
+    if (multiVal === "false") f.multi = false;
+    if (f.type === "date" && f.date_order === "first") delete f.date_order;
+    if (f.type !== "date") delete f.date_order;
+    return f;
+  });
+  return { name: $("#tpl-name").value.trim(), description: $("#tpl-desc").value.trim(), fields };
+}
+function splitCsv(s) {
+  return s.split(/[,，;；\n]/).map(x => x.trim()).filter(Boolean);
+}
+
+$("#btn-save-new").addEventListener("click", async () => {
+  const spec = collectEditorSpec();
+  if (!spec.name) return toast("请填写模板名称", "err");
+  if (!spec.fields.length) return toast("至少定义一个字段", "err");
+  try {
+    const r = await api("/api/ie/templates", { method: "POST", body: spec });
+    toast(`已创建模板「${r.template.name}」v${r.template.version}`);
+    editingId = r.template.template_id;
+    await loadTemplates();
+    $("#tpl-pick").value = editingId;
+    loadVersionIntoPicker();
+  } catch (e) { toast(e.message, "err"); }
+});
+$("#btn-save-version").addEventListener("click", async () => {
+  if (!editingId) return toast("请先选择或创建模板", "err");
+  const spec = collectEditorSpec();
+  try {
+    const r = await api("/api/ie/templates/" + encodeURIComponent(editingId) + "/versions",
+      { method: "POST", body: { ...spec, note: "页面编辑" } });
+    toast(`已保存为 v${r.template.version}，旧版本结果不受影响`);
+    await loadTemplates();
+    $("#tpl-pick").value = editingId;
+    loadVersionIntoPicker();
+  } catch (e) { toast(e.message, "err"); }
+});
+$("#btn-delete-tpl").addEventListener("click", async () => {
+  if (!editingId) return;
+  if (!confirm(`删除模板「${editingId}」的全部版本？已抽取结果会保留。`)) return;
+  try {
+    await api("/api/ie/templates/" + encodeURIComponent(editingId), { method: "DELETE" });
+    toast("模板已删除，历史结果保留");
+    await loadTemplates();
+    loadVersionIntoPicker();
+  } catch (e) { toast(e.message, "err"); }
+});
+$("#btn-tpl-preview").addEventListener("click", async () => {
+  const text = $("#ex-text").value.trim();
+  if (!text) return toast("请先在「抽取与回查」页填写文本", "err");
+  try {
+    const r = await api("/api/ie/preview", { method: "POST",
+      body: { text, fields: collectEditorSpec().fields } });
+    $$(".tab-btn").forEach(b => b.classList.remove("active"));
+    $$(".tab-pane").forEach(p => p.classList.remove("active"));
+    $(`.tab-btn[data-tab="extract"]`).classList.add("active");
+    $("#tab-extract").classList.add("active");
+    renderExtraction({ result: r.result, text, template_name: $("#tpl-name").value || "预览", template_version: "编辑中" });
+  } catch (e) { toast(e.message, "err"); }
+});
+
+/* ---------------- Tab3: 结果台账 ---------------- */
+$("#btn-rs-refresh").addEventListener("click", loadResultsTab);
+$("#btn-rs-tab1").addEventListener("click", async () => {
+  const sel = $("#rs-rows input[name=rs-pick]:checked");
+  if (!sel) return toast("请先选择一条记录", "err");
+  const rec = await api("/api/ie/results/" + sel.value);
+  $$(".tab-btn").forEach(b => b.classList.remove("active"));
+  $$(".tab-pane").forEach(p => p.classList.remove("active"));
+  $(`.tab-btn[data-tab="extract"]`).classList.add("active");
+  $("#tab-extract").classList.add("active");
+  $("#ex-text").value = rec.text;
+  $("#ex-tpl").value = rec.template_id;
+  $("#ex-tpl").dispatchEvent(new Event("change"));
+  $("#ex-version").value = String(rec.template_version);
+  renderExtraction(rec);
+  $("#ex-saved").textContent = `回查结果 #${rec.id}`;
+});
+$("#btn-export-csv").addEventListener("click", () => {
+  const tid = $("#rs-tpl").value, v = $("#rs-version").value;
+  $("#btn-export-csv").href = `/api/ie/results/export.csv?template_id=${encodeURIComponent(tid)}${v ? "&version=" + v : ""}`;
+});
+
+async function loadResultsTab() {
+  if (!TEMPLATES.length) await loadTemplates();
+  const tid = $("#rs-tpl").value, v = $("#rs-version").value;
+  const r = await api(`/api/ie/results?template_id=${encodeURIComponent(tid)}${v ? "&version=" + v : ""}`);
+  if (!r.records.length) {
+    $("#rs-rows").innerHTML = `<tr><td colspan="6" class="hint">该模板下暂无抽取记录。</td></tr>`;
+    return;
+  }
+  $("#rs-rows").innerHTML = r.records.map(rec => {
+    const miss = (rec.missing || []), conf = (rec.conflicts || []);
+    const reqMiss = rec.missing_required || [];
+    return `<tr>
+      <td><label><input type="radio" name="rs-pick" value="${rec.id}"> ${esc(rec.doc_name || ("文本#" + rec.id.slice(-6)))}
+        <div class="hint mono">${esc((rec.text_hash||"").slice(0,10))}…</div></label></td>
+      <td>${esc(rec.template_name)} <span class="vtag">v${rec.template_version}</span></td>
+      <td>${miss.length ? `<span class="vtag miss">${miss.length}</span> <span class="hint">${reqMiss.length? "必填缺 "+reqMiss.length+"，":""}${esc(miss.slice(0,4).join("、"))}${miss.length>4?"…":""}</span>` : '<span class="st-found">无</span>'}</td>
+      <td>${conf.length ? `<span class="vtag conf">${esc(conf.join("、"))}</span>` : '<span class="st-found">无</span>'}</td>
+      <td class="mini">${fmtTime(rec.created_at)}</td>
+      <td><button class="btn small secondary" data-del="${rec.id}">删除</button></td>
+    </tr>`;
+  }).join("");
+  $$("#rs-rows [data-del]").forEach(b => b.addEventListener("click", async () => {
+    if (!confirm("删除该抽取结果？不影响原文和模板。")) return;
+    await api("/api/ie/results/" + b.dataset.del, { method: "DELETE" });
+    loadResultsTab();
+  }));
+}
+
+/* ---------------- 启动 ---------------- */
+loadTemplates().then(() => {
+  $("#ex-tpl").dispatchEvent(new Event("change"));
+}).catch(e => toast("模板加载失败：" + e.message, "err"));
+</script>
+</body>
+</html>
